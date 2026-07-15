@@ -16,6 +16,8 @@ env/
 bin/theHarvester/
 bin/httpx
 bin/cdncheck
+bin/gobuster
+bin/SecLists/
 
 # Runtime results
 Results/*
@@ -30,3 +32,4 @@ Results/*
 .DS_Store
 .idea/
 .vscode/
+.tmp-downloads/

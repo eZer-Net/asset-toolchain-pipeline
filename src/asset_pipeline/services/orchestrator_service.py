@@ -5,12 +5,16 @@ import datetime as dt
 import ipaddress
 import json
 import os
+import secrets
+import socket
 import re
 import shlex
 import subprocess
 import tempfile
 import time
 import urllib.parse
+import urllib.request
+import urllib.error
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from dataclasses import replace
@@ -50,10 +54,15 @@ class PipelineOrchestratorService:
         target_domain = self.input_service.resolve_domain_input(raw_domain)
         print_block("TARGET", [f"domain : {target_domain}"])
 
-        run_config = self.input_service.configure_ports()
-        self.tool_service.print_tools_catalog()
-        tool_paths = self.tool_service.ensure_required_tools_installed()
+        run_config = self.input_service.configure_pipeline()
+        self.print_pipeline_architecture(run_config)
+        self.tool_service.print_tools_catalog(run_config)
+        tool_paths = self.tool_service.ensure_required_tools_installed(run_config)
+        dns_wordlist = self.tool_service.ensure_dns_wordlist(run_config)
+        if dns_wordlist is not None:
+            run_config = replace(run_config, dns_wordlist_path=str(dns_wordlist))
         theharvester_api_sources = self.tool_service.configure_theharvester_api_keys_from_env(tool_paths["theharvester"])
+        self.print_configuration_summary(target_domain, run_config)
 
         output_path = self.input_service.build_output_path_for_domain(target_domain)
         raw_harvester_base_path = self.input_service.build_theharvester_raw_base_path(target_domain)
@@ -67,10 +76,11 @@ class PipelineOrchestratorService:
                 f"ports              : {run_config.ports_display}",
                 "",
                 "stages",
-                "1. theHarvester OSINT + standardization and dependency graph",
-                "2. cdncheck on resolved ip groups",
-                "3. httpx on domain/subdomain/url assets",
-                "4. nmap on ip groups except cdn/cloud/waf",
+                "1. passive and active asset discovery",
+                "2. merge, DNS resolution and HTTP filtering",
+                "3. initial IP -> domain -> subdomain graph",
+                "4. CDN detection and unique-IP port scanning",
+                "5. Recon JSON export",
             ],
         )
 
@@ -88,14 +98,14 @@ class PipelineOrchestratorService:
             if report is not None:
                 self.finalize_report_summary(report)
                 self.persist_report(report, output_path)
-                print_block("STOP", [f"saved-report : {output_path}", "status       : interrupted"])
+                print_block("STOP", [f"recon-import : {output_path}", f"pipeline-log : {output_path.with_name(output_path.stem + '_pipeline' + output_path.suffix)}", "status       : interrupted"])
             else:
                 print_block("STOP", ["status       : interrupted before report initialization"])
             return 130
 
         self.finalize_report_summary(report)
         self.persist_report(report, output_path)
-        print_block("DONE", [f"saved-report : {output_path}", "status       : completed"])
+        print_block("DONE", [f"recon-import : {output_path}", f"pipeline-log : {output_path.with_name(output_path.stem + '_pipeline' + output_path.suffix)}", "status       : completed"])
         return 0
 
     def run_pipeline(
@@ -107,141 +117,359 @@ class PipelineOrchestratorService:
         raw_harvester_base_path: Path,
         theharvester_api_sources: List[str],
     ) -> Dict[str, Any]:
-        raw_harvester_json, raw_harvester_json_path, raw_assets, harvester_returncode = self.run_theharvester_stage(
+        raw_harvester_json, raw_harvester_json_path, harvester_assets, harvester_returncode = self.run_theharvester_stage(
             target_domain=target_domain,
             theharvester_path=tool_paths["theharvester"],
             raw_output_base_path=raw_harvester_base_path,
         )
-        report, normalized_assets, assets_by_type, dependency_stats = self.run_standardization_stage(raw_assets, run_config, output_path, target_domain)
+
+        discovery_sources: Dict[str, List[Dict[str, Any]]] = {"theHarvester": harvester_assets}
+        discovery_sources["certificate-transparency"] = self.run_certificate_transparency_stage(target_domain)
+        if run_config.dns_bruteforce_enabled:
+            discovery_sources["dns-bruteforce"] = self.run_dns_bruteforce_stage(
+                target_domain, tool_paths["gobuster"], Path(str(run_config.dns_wordlist_path))
+            )
+        raw_assets = self.merge_discovered_assets(discovery_sources, target_domain)
+
+        report, _, _, _ = self.run_standardization_stage(raw_assets, run_config, output_path, target_domain)
+        report.setdefault("summary", {})["discovery-sources"] = {name: len(items) for name, items in discovery_sources.items()}
+        report["summary"]["discovered-assets-after-deduplication"] = len(raw_assets)
         self.apply_theharvester_summary(
-            report=report,
-            target_domain=target_domain,
-            raw_json_path=raw_harvester_json_path,
-            raw_harvester_json=raw_harvester_json,
-            converted_assets=raw_assets,
-            api_sources=theharvester_api_sources,
-            returncode=harvester_returncode,
+            report=report, target_domain=target_domain, raw_json_path=raw_harvester_json_path,
+            raw_harvester_json=raw_harvester_json, converted_assets=harvester_assets,
+            api_sources=theharvester_api_sources, returncode=harvester_returncode,
         )
         self.persist_report(report, output_path)
+
+        resolved_http_targets = self.collect_resolved_http_targets(report)
+        httpx_block = LiveBlock("PIPELINE 2/5 · host validation", [
+            f"targets     : {len(resolved_http_targets)}",
+            f"status-filter: {run_config.status_filter_display}",
+            f"workers     : {get_httpx_workers()}",
+            "command     : httpx -json -probe -status-code -ip -location -fr -include-chain -silent",
+        ])
+        httpx_block.open()
+        httpx_stats = self.execute_parallel_stage(
+            items=resolved_http_targets, worker_count=get_httpx_workers(),
+            task_func=lambda target: self.run_httpx_single(target, tool_paths["httpx"]),
+            on_result=lambda target, payload: self.apply_httpx_single_result(report, target, payload),
+            output_path=output_path, report=report, submit_delay=self.get_httpx_submit_delay(), live_block=httpx_block,
+        )
+        removed_hosts = self.apply_http_status_filter(report, run_config.status_codes, include_urls=False)
+        httpx_block.close([f"processed   : {httpx_stats['done']}/{httpx_stats['total']}", f"errors      : {httpx_stats['failed']}", f"filtered-out: {removed_hosts}"])
 
         ip_groups = self.build_ip_group_map(report["ips"])
         ip_targets = list(ip_groups.keys())
-        resolved_http_targets = self.collect_resolved_http_targets(report)
-        cdn_map: Dict[str, List[Dict[str, Any]]] = {}
+        print_block("PIPELINE 3/5 · ASSET RELATION GRAPH", [
+            f"ip-groups   : {len(ip_targets)}",
+            f"domains     : {sum(len(g.get('domains', [])) for g in report.get('ips', []))}",
+            f"subdomains  : {sum(len(g.get('subdomains', [])) for g in report.get('ips', []))}",
+            "relation     : IP -> Domain -> Subdomain",
+        ])
 
-        cdn_command_template = self.format_command([tool_paths["cdncheck"], "-i", "<ip>", "-j", "-resp", "-silent"])
-        cdn_block = LiveBlock(
-            "PIPELINE 2/4 · cdncheck",
-            [
-                f"ips        : {len(ip_targets)}",
-                f"workers    : {get_cdncheck_workers()}",
-                f"command    : {cdn_command_template}",
-                f"first-ip   : {ip_targets[0] if ip_targets else 'n/a'}",
-            ],
-        )
+        cdn_map: Dict[str, List[Dict[str, Any]]] = {}
+        cdn_block = LiveBlock("PIPELINE 4/5 · IP enrichment / cdncheck", [f"ips        : {len(ip_targets)}", f"workers    : {get_cdncheck_workers()}"])
         cdn_block.open()
         cdn_stats = self.execute_parallel_stage(
-            items=ip_targets,
-            worker_count=get_cdncheck_workers(),
+            items=ip_targets, worker_count=get_cdncheck_workers(),
             task_func=lambda ip_value: self.run_cdncheck_single(ip_value, tool_paths["cdncheck"]),
             on_result=lambda ip_value, records: self.apply_cdncheck_single_result(report, cdn_map, ip_value, records),
-            output_path=output_path,
-            report=report,
-            live_block=cdn_block,
+            output_path=output_path, report=report, live_block=cdn_block,
         )
-        cdn_block.close(
-            [
-                f"processed  : {cdn_stats['done']}/{cdn_stats['total']}",
-                f"errors     : {cdn_stats['failed']}",
-                f"matched    : {sum(1 for records in cdn_map.values() if self.has_cdn_detection(records))}",
-            ]
-        )
+        cdn_block.close([f"processed  : {cdn_stats['done']}/{cdn_stats['total']}", f"errors     : {cdn_stats['failed']}"])
 
-        httpx_command_template = self.format_command([
-            tool_paths["httpx"],
-            "-u",
-            "<target>",
-            "-json",
-            "-probe",
-            "-status-code",
-            "-ip",
-            "-location",
-            "-fr",
-            "-include-chain",
-            "-silent",
-        ])
-        httpx_block = LiveBlock(
-            "PIPELINE 3/4 · httpx",
-            [
-                f"targets     : {len(resolved_http_targets)}",
-                f"workers     : {get_httpx_workers()}",
-                f"launch-gap  : {self.get_httpx_submit_delay():.1f}s",
-                f"command    : {httpx_command_template}",
-                f"first-target: {resolved_http_targets[0] if resolved_http_targets else 'n/a'}",
-            ],
-        )
-        httpx_block.open()
-        httpx_stats = self.execute_parallel_stage(
-            items=resolved_http_targets,
-            worker_count=get_httpx_workers(),
-            task_func=lambda target: self.run_httpx_single(target, tool_paths["httpx"]),
-            on_result=lambda target, payload: self.apply_httpx_single_result(report, target, payload),
-            output_path=output_path,
-            report=report,
-            submit_delay=self.get_httpx_submit_delay(),
-            live_block=httpx_block,
-        )
-        httpx_block.close(
-            [
-                f"processed   : {httpx_stats['done']}/{httpx_stats['total']}",
-                f"errors      : {httpx_stats['failed']}",
-                "note        : unresolved assets remain in unresolved-assets and are not sent to httpx",
-            ]
-        )
-
-        run_port_ips: List[str] = []
-        for ip_value in ip_targets:
-            if self.should_skip_ports_for_cdn(cdn_map.get(ip_value, [])):
-                continue
-            run_port_ips.append(ip_value)
-
+        run_port_ips = [ip for ip in ip_targets if not self.should_skip_ports_for_cdn(cdn_map.get(ip, []))]
         self.initialize_port_scan_notes(report, cdn_map, run_port_ips)
-        self.persist_report(report, output_path)
-
-        nmap_command_template = self.format_command([tool_paths["nmap"], "-Pn", "-n", "-sV", "-p", run_config.ports_csv, "-oX", "-", "<ip>"])
-        nmap_block = LiveBlock(
-            "PIPELINE 4/4 · nmap",
-            [
-                f"scan-ips   : {len(run_port_ips)}",
-                f"skipped-cdn: {len(ip_targets) - len(run_port_ips)} cdn/cloud/waf ip groups",
-                f"workers    : {get_ports_workers()} parallel nmap processes",
-                f"ports      : {run_config.ports_display}",
-                "version    : full service detection (-sV)",
-                f"command    : {nmap_command_template}",
-                "ipv6-note  : -6 is added automatically for IPv6 targets",
-                f"first-ip   : {run_port_ips[0] if run_port_ips else 'n/a'}",
-            ],
-        )
+        nmap_workers = min(get_ports_workers(), 2) if run_config.full_scan else get_ports_workers()
+        if run_config.full_scan:
+            command_display = self.format_command([
+                tool_paths["nmap"], "-Pn", "-n", "-p-", "-T4", "--min-rate", "1000",
+                "--max-retries", "2", "--host-timeout", "15m", "-oX", "-", "<ip>",
+            ]) + " -> -sV only on discovered open ports"
+        else:
+            command_display = self.format_command([
+                tool_paths["nmap"], "-Pn", "-n", "-sV", "-T4", "--max-retries", "2",
+                "--host-timeout", "10m", "-p", run_config.ports_csv, "-oX", "-", "<ip>",
+            ])
+        nmap_block = LiveBlock("PIPELINE 4/5 · IP enrichment / nmap", [
+            f"scan-ips   : {len(run_port_ips)}", f"skipped-cdn: {len(ip_targets)-len(run_port_ips)}",
+            f"ports      : {run_config.ports_display}",
+            f"workers    : {nmap_workers}",
+            f"command    : {command_display}",
+        ])
         nmap_block.open()
         nmap_stats = self.execute_parallel_stage(
-            items=run_port_ips,
-            worker_count=get_ports_workers(),
+            items=run_port_ips, worker_count=nmap_workers,
             task_func=lambda ip_value: self.run_nmap_single(ip_value, tool_paths["nmap"], run_config),
             on_result=lambda ip_value, records: self.apply_ports_single_result(report, ip_value, records),
-            output_path=output_path,
-            report=report,
-            live_block=nmap_block,
+            output_path=output_path, report=report, live_block=nmap_block,
         )
-        nmap_block.close(
-            [
-                f"processed  : {nmap_stats['done']}/{nmap_stats['total']}",
-                f"errors     : {nmap_stats['failed']}",
-                f"skipped-cdn: {len(ip_targets) - len(run_port_ips)}",
-            ]
-        )
+        nmap_block.close([f"processed  : {nmap_stats['done']}/{nmap_stats['total']}", f"errors     : {nmap_stats['failed']}"])
 
         self.update_runtime_summary(report, cdn_map, run_port_ips, resolved_http_targets)
+        print_block("PIPELINE 5/5 · REPORT GENERATION", ["assets       : normalized", "relations    : generated", "port-bindings: generated", "format       : assets + relations + portBindings"])
         return report
+
+    def print_pipeline_architecture(self, run_config: RunConfig) -> None:
+        print_block("ASSET TOOLCHAIN", [
+            "Target Domain",
+            "  -> OSINT Asset Discovery",
+            "     -> Passive: theHarvester + Certificate Transparency",
+            "     -> Active : optional DNS bruteforce with Gobuster",
+            "  -> Merge, deduplicate, DNS resolve and HTTP filtering",
+            "  -> IP -> Domain -> Subdomain relation graph",
+            "  -> CDN/WAF detection and unique-IP port scan",
+            "  -> Final Recon JSON for Pentester Dashboard",
+        ])
+
+    def print_configuration_summary(self, target_domain: str, run_config: RunConfig) -> None:
+        print_block("ASSET TOOLCHAIN CONFIGURATION", [
+            f"target              : {target_domain}",
+            "passive OSINT       : theHarvester + Certificate Transparency",
+            f"DNS bruteforce      : {run_config.dns_bruteforce_profile}",
+            f"wordlist            : {run_config.dns_wordlist_path or 'n/a'}",
+            f"HTTP status filter  : {run_config.status_filter_display}",
+            f"port scan           : {run_config.ports_display}",
+        ])
+
+    def run_certificate_transparency_stage(self, target_domain: str) -> List[Dict[str, Any]]:
+        timeout = self.get_certificate_transparency_timeout()
+        url = "https://crt.sh/?q=" + urllib.parse.quote(f"%.{target_domain}") + "&output=json"
+        block = LiveBlock(
+            "PIPELINE 1/5 · PASSIVE OSINT / Certificate Transparency",
+            [
+                f"domain  : {target_domain}",
+                "source  : crt.sh HTTP API",
+                f"timeout : {timeout}s",
+            ],
+        )
+        block.open()
+        started = time.monotonic()
+        request = urllib.request.Request(url, headers={"User-Agent": shared.USER_AGENT})
+        try:
+            with cf.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(self._fetch_certificate_transparency, request, timeout)
+                while not future.done():
+                    elapsed = int(time.monotonic() - started)
+                    block.update(f"[{'#' * min(20, elapsed % 21):<20}] crt.sh query | running | elapsed {elapsed}s")
+                    if elapsed >= timeout:
+                        future.cancel()
+                        raise TimeoutError(f"crt.sh did not answer within {timeout}s")
+                    time.sleep(0.25)
+                payload = future.result()
+        except Exception as exc:
+            block.close(["status  : skipped", f"reason  : {exc}", "continue: theHarvester and remaining stages"], keep_last_progress=False)
+            return []
+
+        assets: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in payload if isinstance(payload, list) else []:
+            if not isinstance(item, dict):
+                continue
+            for raw_name in str(item.get("name_value", "")).splitlines():
+                host = self.input_service.normalize_domain_input(raw_name)
+                if not host or (host != target_domain and not host.endswith("." + target_domain)) or host in seen:
+                    continue
+                seen.add(host)
+                assets.append({"value": host, "type": "domain" if host == target_domain else "subdomain", "notes": "Certificate Transparency"})
+        block.close([f"status  : completed", f"assets  : {len(assets)}", f"elapsed : {int(time.monotonic() - started)}s"])
+        return assets
+
+    def _fetch_certificate_transparency(self, request: urllib.request.Request, timeout: int) -> Any:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8", errors="replace"))
+
+    def get_certificate_transparency_timeout(self) -> int:
+        raw = os.environ.get("ASSET_PIPELINE_CRTSH_TIMEOUT", "180").strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            return 180
+        return max(10, value)
+
+    def run_dns_bruteforce_stage(self, target_domain: str, gobuster_path: str, wordlist: Path) -> List[Dict[str, Any]]:
+        entries = self.count_wordlist_entries(wordlist)
+        delay_ms = 250
+        wildcard_ips = self.detect_wildcard_dns(target_domain)
+        if wildcard_ips:
+            print_block(
+                "PIPELINE 1/5 · ACTIVE DNS DISCOVERY / Gobuster",
+                [
+                    f"domain    : {target_domain}",
+                    f"wordlist  : {wordlist}",
+                    f"entries   : {entries}",
+                    "status    : skipped",
+                    "reason    : wildcard DNS detected",
+                    f"wildcard  : {', '.join(wildcard_ips)}",
+                    "continue  : passive OSINT and remaining stages",
+                ],
+            )
+            return []
+
+        command = [
+            gobuster_path, "dns",
+            "-d", target_domain,
+            "-w", str(wordlist),
+            "-t", "1",
+            "--delay", f"{delay_ms}ms",
+            "--timeout", "3s",
+            "--no-error",
+            "--no-color",
+        ]
+        estimated_seconds = int(entries * delay_ms / 1000) if entries else 0
+        timeout = max(7200, int(entries * 0.6) + 600)
+        block = LiveBlock(
+            "PIPELINE 1/5 · ACTIVE DNS DISCOVERY / Gobuster",
+            [
+                f"domain    : {target_domain}",
+                f"wordlist  : {wordlist}",
+                f"entries   : {entries}",
+                f"workers   : 1",
+                f"delay     : {delay_ms}ms between DNS requests",
+                f"minimum   : ~{self.format_duration(estimated_seconds)}",
+                f"command   : {self.format_command(command)}",
+            ],
+        )
+        block.open()
+        started = time.monotonic()
+        try:
+            completed = self.run_command_with_live_progress(
+                command=command,
+                cwd=None,
+                timeout=timeout,
+                live_block=block,
+                label="Gobuster DNS",
+            )
+        except Exception:
+            block.close(["status    : failed"], keep_last_progress=False)
+            raise
+
+        assets: List[Dict[str, Any]] = []
+        combined_output = "\n".join(part for part in (completed.stdout or "", completed.stderr or "") if part)
+        if "returned the same IP for every domain" in combined_output or "--wildcard" in combined_output and completed.returncode != 0:
+            match = re.search(r"IP address\(es\) returned:\s*([^\n]+)", combined_output)
+            wildcard = match.group(1).strip() if match else "detected by Gobuster"
+            block.close([
+                "status    : skipped",
+                "reason    : wildcard DNS detected",
+                f"wildcard  : {wildcard}",
+                "continue  : passive OSINT and remaining stages",
+            ], keep_last_progress=False)
+            return []
+        for line in combined_output.splitlines():
+            match = re.search(r"(?:Found:\s*)?([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)", line)
+            if not match:
+                continue
+            host = match.group(1).lower().rstrip(".")
+            if host.endswith("." + target_domain):
+                assets.append({"value": host, "type": "subdomain", "notes": "DNS bruteforce"})
+        assets = self.unique_asset_records(assets)
+        elapsed = int(time.monotonic() - started)
+        final_lines = [
+            f"status    : {'completed' if completed.returncode == 0 else 'completed with warnings'}",
+            f"processed : {entries}",
+            f"found     : {len(assets)}",
+            f"elapsed   : {self.format_duration(elapsed)}",
+        ]
+        if completed.returncode != 0:
+            final_lines.append(f"exit-code : {completed.returncode}")
+        block.close(final_lines)
+        return assets
+
+    def detect_wildcard_dns(self, target_domain: str, probes: int = 3) -> List[str]:
+        """Return wildcard DNS addresses when random labels resolve consistently."""
+        resolved_sets: List[set[str]] = []
+        for _ in range(max(2, probes)):
+            label = f"asset-toolchain-{secrets.token_hex(8)}.{target_domain}"
+            try:
+                addresses = {
+                    item[4][0]
+                    for item in socket.getaddrinfo(label, None, type=socket.SOCK_STREAM)
+                    if item and len(item) > 4 and item[4]
+                }
+            except socket.gaierror:
+                return []
+            except OSError:
+                return []
+            if not addresses:
+                return []
+            resolved_sets.append(addresses)
+
+        common = set.intersection(*resolved_sets) if resolved_sets else set()
+        return sorted(common)
+
+    def count_wordlist_entries(self, wordlist: Path) -> int:
+        try:
+            with wordlist.open("r", encoding="utf-8", errors="ignore") as handle:
+                return sum(1 for line in handle if line.strip() and not line.lstrip().startswith("#"))
+        except OSError:
+            return 0
+
+    def format_duration(self, seconds: int) -> str:
+        seconds = max(0, int(seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}h {minutes}m {seconds}s"
+        if minutes:
+            return f"{minutes}m {seconds}s"
+        return f"{seconds}s"
+
+    def merge_discovered_assets(self, sources: Dict[str, List[Dict[str, Any]]], target_domain: str) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = [{"value": target_domain, "type": "domain", "notes": "Target domain"}]
+        for source_name, items in sources.items():
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                clone = dict(item)
+                notes = str(clone.get("notes", "")).strip()
+                clone["notes"] = "; ".join(part for part in (notes, source_name) if part)
+                merged.append(clone)
+        return self.unique_asset_records(merged)
+
+    def unique_asset_records(self, assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        index: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for item in assets:
+            value = str(item.get("value", "")).strip()
+            asset_type = str(item.get("type", "")).strip()
+            if not value or asset_type not in {"ip", "domain", "subdomain"}:
+                continue
+            key = (asset_type, value.lower())
+            if key in index:
+                old_notes = str(index[key].get("notes", "")).strip()
+                new_notes = str(item.get("notes", "")).strip()
+                note_parts = []
+                for part in (old_notes + "; " + new_notes).split(";"):
+                    part = part.strip()
+                    if part and part not in note_parts:
+                        note_parts.append(part)
+                if note_parts:
+                    index[key]["notes"] = "; ".join(note_parts)
+                continue
+            clone = dict(item)
+            index[key] = clone
+            result.append(clone)
+        return result
+
+    def apply_http_status_filter(self, report: Dict[str, Any], allowed: Optional[List[int]], include_urls: bool = False, urls_only: bool = False) -> int:
+        if allowed is None:
+            return 0
+        allowed_set = set(allowed)
+        removed = 0
+        retained_groups: List[Dict[str, Any]] = []
+        for group in report.get("ips", []):
+            if not isinstance(group, dict):
+                continue
+            if not urls_only:
+                for key in ("domains", "subdomains"):
+                    before = len(group.get(key, []))
+                    group[key] = [entry for entry in group.get(key, []) if self.httpx_status_code(entry) in allowed_set]
+                    removed += before - len(group[key])
+            if group.get("input-ip-assets") or group.get("domains") or group.get("subdomains"):
+                retained_groups.append(group)
+        report["ips"] = retained_groups
+        return removed
 
     def run_theharvester_stage(
         self,
@@ -263,7 +491,7 @@ class PipelineOrchestratorService:
             started_at = time.time()
 
             stage_block = LiveBlock(
-                "PIPELINE 1/4 · theHarvester + standardization",
+                "PIPELINE 1/5 · PASSIVE OSINT / theHarvester",
                 [
                     f"domain      : {target_domain}",
                     f"raw-json    : {raw_json_path}",
@@ -718,15 +946,6 @@ class PipelineOrchestratorService:
             target_type = "domain" if host == target_domain else "subdomain"
             add_asset(host, target_type, "theHarvester hosts")
 
-        url_candidates: List[str] = []
-        url_candidates.extend(normalized.get("urls", []))
-        url_candidates.extend(normalized.get("interesting-urls", []))
-        url_candidates.extend(self.extract_urls_from_anywhere(raw_payload))
-        for url_value in self.unique_preserve_order(url_candidates):
-            normalized_url = self.normalize_harvester_url_candidate(url_value)
-            if normalized_url:
-                add_asset(normalized_url, "url", "theHarvester urls")
-
         return assets
 
     def collect_theharvester_hosts(self, raw_json: Any) -> List[str]:
@@ -1015,10 +1234,10 @@ class PipelineOrchestratorService:
     ) -> Tuple[Dict[str, Any], List[Any], Dict[str, int], Dict[str, int]]:
         total = len(raw_assets)
         stage_block = LiveBlock(
-            "PIPELINE 1/4 · standardization",
+            "PIPELINE 2/5 · MERGE, DNS RESOLUTION AND NORMALIZATION",
             [
                 f"assets      : {total}",
-                "dependency  : ip -> domain/subdomain -> url",
+                "dependency  : ip -> domain -> subdomain",
                 "command    : internal Python normalization + socket.getaddrinfo(host)",
             ],
         )
@@ -1026,7 +1245,7 @@ class PipelineOrchestratorService:
 
         normalized_assets: List[Any] = []
         resolve_cache: Dict[str, Optional[str]] = {}
-        assets_by_type: Dict[str, int] = {"ip": 0, "domain": 0, "subdomain": 0, "url": 0}
+        assets_by_type: Dict[str, int] = {"ip": 0, "domain": 0, "subdomain": 0}
         linked_to_ip = 0
         unresolved_assets = 0
 
@@ -1177,12 +1396,12 @@ class PipelineOrchestratorService:
             "assets-total": len(assets),
             "domains-total": sum(1 for asset in assets if asset.target_type == "domain"),
             "subdomains-total": sum(1 for asset in assets if asset.target_type == "subdomain"),
-            "urls-total": sum(1 for asset in assets if asset.target_type == "url"),
             "direct-ip-inputs-total": sum(1 for asset in assets if asset.target_type == "ip"),
             "ip-groups-total": len(groups),
             "unresolved-assets-total": len(unresolved_assets),
             "unmapped-assets-total": len(unmapped_assets),
-            "ports-scanned": run_config.ports,
+            "ports-scanned": "1-65535" if run_config.full_scan else run_config.ports,
+            "full-port-scan": run_config.full_scan,
             "cdncheck-enabled": True,
             "cdncheck-matched-ip-groups": 0,
             "ports-stage-ran-for-ip-groups": 0,
@@ -1221,9 +1440,6 @@ class PipelineOrchestratorService:
                 self.append_unique_httpx_asset(group["domains"], self.build_httpx_asset_entry(asset))
             elif asset.target_type == "subdomain":
                 self.append_unique_httpx_asset(group["subdomains"], self.build_httpx_asset_entry(asset))
-            elif asset.target_type == "url":
-                if not self.attach_url_asset_to_host(group, asset, normalized_target_domain):
-                    unmapped_assets.append(self.build_unmapped_asset_entry(asset, "url-host-not-detected"))
             else:
                 unmapped_assets.append(self.build_unmapped_asset_entry(asset, "unsupported-target-type"))
 
@@ -1251,16 +1467,11 @@ class PipelineOrchestratorService:
             entry["notes"] = asset.notes
         return entry
 
-    def build_synthetic_host_entry(self, host: str, notes: str = "theHarvester url-host") -> Dict[str, Any]:
-        return {"target": host, "notes": notes, "result-httpx": [], "urls": []}
-
     def append_unique_httpx_asset(self, collection: List[Dict[str, Any]], entry: Dict[str, Any]) -> Dict[str, Any]:
         target = str(entry.get("target", "")).strip().lower()
         for existing in collection:
             if str(existing.get("target", "")).strip().lower() == target:
                 self.merge_asset_notes(existing, entry)
-                if "urls" in entry:
-                    existing.setdefault("urls", [])
                 return existing
         collection.append(entry)
         return entry
@@ -1270,43 +1481,13 @@ class PipelineOrchestratorService:
         incoming_note = str(incoming.get("notes", "")).strip()
         if not incoming_note or incoming_note == existing_note:
             return
-        if not existing_note or existing_note == "theHarvester url-host":
+        if not existing_note:
             existing["notes"] = incoming_note
             return
         parts = [part.strip() for part in existing_note.split(";") if part.strip()]
         if incoming_note not in parts:
             parts.append(incoming_note)
             existing["notes"] = "; ".join(parts)
-
-    def attach_url_asset_to_host(self, group: Dict[str, Any], asset: Any, target_domain: str) -> bool:
-        url_host = self.extract_url_host(asset.target)
-        if not url_host:
-            return False
-
-        url_entry = self.build_httpx_asset_entry(asset)
-        owner = self.find_http_host_entry(group, url_host)
-        if owner is None:
-            host_entry = self.build_synthetic_host_entry(url_host)
-            if target_domain and url_host == target_domain:
-                owner = self.append_unique_httpx_asset(group.setdefault("domains", []), host_entry)
-            else:
-                owner = self.append_unique_httpx_asset(group.setdefault("subdomains", []), host_entry)
-
-        urls = owner.setdefault("urls", [])
-        self.append_unique_httpx_asset(urls, url_entry)
-        return True
-
-    def find_http_host_entry(self, group: Dict[str, Any], host: str) -> Optional[Dict[str, Any]]:
-        normalized_host = host.strip().lower()
-        for key in ("domains", "subdomains"):
-            for entry in group.get(key, []):
-                if not isinstance(entry, dict):
-                    continue
-                entry_host = self.extract_asset_host(str(entry.get("target", "")))
-                if entry_host == normalized_host:
-                    entry.setdefault("urls", [])
-                    return entry
-        return None
 
     def extract_asset_host(self, value: str) -> str:
         value = str(value).strip()
@@ -1353,22 +1534,221 @@ class PipelineOrchestratorService:
     def persist_report(self, report: Optional[Dict[str, Any]], output_path: Any) -> None:
         if report is None:
             return
-        payload = {
+
+        diagnostic_payload = {
             "summary": report.get("summary", {}),
             "ips": [self.serialize_ip_group(group) for group in report.get("ips", []) if isinstance(group, dict)],
             "unresolved-assets": [self.serialize_unresolved_asset(item) for item in report.get("unresolved-assets", []) if isinstance(item, dict)],
             "unmapped-assets": [self.serialize_unmapped_asset(item) for item in report.get("unmapped-assets", []) if isinstance(item, dict)],
         }
+        diagnostic_path = output_path.with_name(f"{output_path.stem}_pipeline{output_path.suffix}")
+        self.atomic_write_json(diagnostic_path, diagnostic_payload)
+
+        import_payload = self.build_recon_import_payload(report)
+        self.atomic_write_json(output_path, import_payload)
+
+    def atomic_write_json(self, output_path: Path, payload: Dict[str, Any]) -> None:
         temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
         temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temp_path.replace(output_path)
+
+    def build_recon_import_payload(self, report: Dict[str, Any]) -> Dict[str, Any]:
+        assets: List[Dict[str, Any]] = []
+        relations: List[Dict[str, Any]] = []
+        bindings: List[Dict[str, Any]] = []
+        asset_ids: Dict[Tuple[str, str], int] = {}
+
+        def add_asset(
+            value: str,
+            asset_type: str,
+            notes: str = "",
+            ports: Optional[List[Dict[str, Any]]] = None,
+            status_code: Optional[int] = None,
+        ) -> int:
+            key = (asset_type, value.strip().lower())
+            if key in asset_ids:
+                asset_id = asset_ids[key]
+                existing = assets[asset_id - 1]
+                if asset_type != "ip" and isinstance(status_code, int) and "statusCode" not in existing:
+                    existing["statusCode"] = status_code
+                return asset_id
+            asset_id = len(assets) + 1
+            item: Dict[str, Any] = {"id": asset_id, "value": value, "type": asset_type}
+            if notes.strip():
+                item["notes"] = notes.strip()
+            if asset_type == "ip" and ports:
+                item["ports"] = ports
+            if asset_type != "ip" and isinstance(status_code, int):
+                item["statusCode"] = status_code
+            assets.append(item)
+            asset_ids[key] = asset_id
+            return asset_id
+
+        for group in report.get("ips", []):
+            if not isinstance(group, dict):
+                continue
+            ip_value = str(group.get("ip", "")).strip()
+            if not ip_value:
+                continue
+            ports = self.recon_ports_from_group(group)
+            ip_notes = self.recon_asset_notes(self.first_group_ip_notes(group), group)
+            ip_id = add_asset(ip_value, "ip", ip_notes, ports)
+
+            domain_entries = [entry for entry in group.get("domains", []) if isinstance(entry, dict)]
+            subdomain_entries = [entry for entry in group.get("subdomains", []) if isinstance(entry, dict)]
+            host_ids: Dict[str, int] = {}
+
+            for entry in domain_entries:
+                host = self.extract_asset_host(str(entry.get("target", "")))
+                if not host:
+                    continue
+                host_notes = self.recon_asset_notes(str(entry.get("notes", "")), group)
+                host_id = add_asset(host, "domain", host_notes, status_code=self.httpx_status_code(entry))
+                host_ids[host] = host_id
+                relations.append(self.recon_relation(ip_id, host_id, "HOSTS"))
+                self.append_host_port_bindings(bindings, host_id, ip_id, ports)
+
+            for entry in subdomain_entries:
+                host = self.extract_asset_host(str(entry.get("target", "")))
+                if not host:
+                    continue
+                host_notes = self.recon_asset_notes(str(entry.get("notes", "")), group)
+                host_id = add_asset(host, "subdomain", host_notes, status_code=self.httpx_status_code(entry))
+                host_ids[host] = host_id
+                parent_id = self.find_parent_domain_id(host, host_ids)
+                if parent_id is not None:
+                    relations.append(self.recon_relation(parent_id, host_id, "HAS_SUBDOMAIN"))
+                else:
+                    relations.append(self.recon_relation(ip_id, host_id, "HOSTS"))
+                self.append_host_port_bindings(bindings, host_id, ip_id, ports)
+
+        for item in report.get("unresolved-assets", []):
+            if not isinstance(item, dict):
+                continue
+            target = str(item.get("target", "")).strip()
+            asset_type = str(item.get("target-type", "")).strip()
+            if target and asset_type in {"domain", "subdomain"}:
+                add_asset(target, asset_type, str(item.get("notes", "")), status_code=self.httpx_status_code(item))
+
+        return {"assets": assets, "relations": self.normalize_primary_relations(relations), "portBindings": self.unique_dicts(bindings)}
+
+    def recon_ports_from_group(self, group: Dict[str, Any]) -> List[Dict[str, Any]]:
+        ports: List[Dict[str, Any]] = []
+        for record in group.get("result-ports", []):
+            if not isinstance(record, dict) or not isinstance(record.get("port"), int):
+                continue
+            item: Dict[str, Any] = {
+                "port": record["port"],
+                "protocol": str(record.get("protocol") or "tcp"),
+                "state": str(record.get("status") or "unknown"),
+            }
+            for key in ("service", "version"):
+                value = record.get(key)
+                if isinstance(value, str) and value.strip():
+                    item[key] = value.strip()
+            ports.append(item)
+        return ports
+
+    def first_group_ip_notes(self, group: Dict[str, Any]) -> str:
+        for item in group.get("input-ip-assets", []):
+            if isinstance(item, dict) and isinstance(item.get("notes"), str) and item["notes"].strip():
+                return item["notes"].strip()
+        return ""
+
+    def recon_asset_notes(self, raw_notes: str, group: Dict[str, Any]) -> str:
+        found = self.recon_found_sources(raw_notes)
+        status = self.recon_infrastructure_status(group)
+        return f"found: {found} | status: {status}"
+
+    def recon_found_sources(self, raw_notes: str) -> str:
+        parts = [part.strip() for part in str(raw_notes or "").split(";") if part.strip()]
+        ignored = {"theHarvester", "certificate-transparency", "dns-bruteforce"}
+        normalized: List[str] = []
+        for part in parts:
+            if part in ignored:
+                continue
+            display = {
+                "Certificate Transparency": "Certificate Transparency (crt.sh)",
+                "DNS bruteforce": "Gobuster DNS bruteforce",
+            }.get(part, part)
+            if display not in normalized:
+                normalized.append(display)
+        return ", ".join(normalized) if normalized else "pipeline discovery"
+
+    def recon_infrastructure_status(self, group: Dict[str, Any]) -> str:
+        records = group.get("result-cdncheck", [])
+        if isinstance(records, list):
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                record_type = str(record.get("type", "")).strip().lower()
+                if record_type not in {"cdn", "cloud", "waf"}:
+                    continue
+                provider = str(record.get("provider", "")).strip()
+                if provider and provider.lower() != "null":
+                    return provider.replace("-", " ").title()
+                return record_type.upper() if record_type == "waf" else record_type.title()
+        return "On-premises"
+
+    def recon_relation(self, parent_id: int, child_id: int, relation_type: str) -> Dict[str, Any]:
+        return {"parentAssetId": parent_id, "childAssetId": child_id, "relationType": relation_type, "isPrimary": True}
+
+    def append_host_port_bindings(self, bindings: List[Dict[str, Any]], asset_id: int, ip_id: int, ports: List[Dict[str, Any]]) -> None:
+        # Port bindings represent services that are actually reachable on a related IP.
+        # Filtered/unknown ports remain on the IP asset, but are not copied to every host.
+        for port in ports:
+            if str(port.get("state", "")).lower() != "open":
+                continue
+            bindings.append({"assetId": asset_id, "ipAssetId": ip_id, "port": port["port"], "protocol": port.get("protocol", "tcp"), "bindingSource": "MANUAL"})
+
+    def httpx_status_code(self, asset_entry: Dict[str, Any]) -> Optional[int]:
+        records = asset_entry.get("result-httpx", [])
+        if not isinstance(records, list):
+            return None
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            value = record.get("status-code")
+            if isinstance(value, int) and 100 <= value <= 599:
+                return value
+            if isinstance(value, str) and value.isdigit():
+                parsed = int(value)
+                if 100 <= parsed <= 599:
+                    return parsed
+        return None
+
+    def find_parent_domain_id(self, host: str, host_ids: Dict[str, int]) -> Optional[int]:
+        candidates = [candidate for candidate in host_ids if host.endswith(f".{candidate}")]
+        if not candidates:
+            return None
+        parent = max(candidates, key=len)
+        return host_ids[parent]
+
+    def normalize_primary_relations(self, relations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        unique = self.unique_dicts(relations)
+        primary_children: set[int] = set()
+        for relation in unique:
+            child_id = int(relation.get("childAssetId", 0))
+            relation["isPrimary"] = child_id not in primary_children
+            primary_children.add(child_id)
+        return unique
+
+    def unique_dicts(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in items:
+            key = json.dumps(item, sort_keys=True, ensure_ascii=False)
+            if key not in seen:
+                seen.add(key)
+                result.append(item)
+        return result
 
     def serialize_ip_group(self, group: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "ip": group.get("ip"),
             "input-ip-assets": [self.serialize_direct_asset(item) for item in group.get("input-ip-assets", []) if isinstance(item, dict)],
-            "domains": [self.serialize_httpx_asset(item, include_child_urls=True) for item in group.get("domains", []) if isinstance(item, dict)],
-            "subdomains": [self.serialize_httpx_asset(item, include_child_urls=True) for item in group.get("subdomains", []) if isinstance(item, dict)],
+            "domains": [self.serialize_httpx_asset(item) for item in group.get("domains", []) if isinstance(item, dict)],
+            "subdomains": [self.serialize_httpx_asset(item) for item in group.get("subdomains", []) if isinstance(item, dict)],
             "result-cdncheck": group.get("result-cdncheck", []),
             "result-ports": group.get("result-ports", []),
         }
@@ -1380,20 +1760,12 @@ class PipelineOrchestratorService:
             result["notes"] = notes.strip()
         return result
 
-    def serialize_httpx_asset(self, item: Dict[str, Any], include_child_urls: bool = False) -> Dict[str, Any]:
+    def serialize_httpx_asset(self, item: Dict[str, Any]) -> Dict[str, Any]:
         result: Dict[str, Any] = {"target": item.get("target")}
         notes = item.get("notes")
         if isinstance(notes, str) and notes.strip():
             result["notes"] = notes.strip()
         result["result-httpx"] = item.get("result-httpx", [])
-        if include_child_urls:
-            child_urls = [
-                self.serialize_httpx_asset(child, include_child_urls=False)
-                for child in item.get("urls", [])
-                if isinstance(child, dict)
-            ]
-            if child_urls:
-                result["urls"] = child_urls
         return result
 
     def serialize_unresolved_asset(self, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -1439,12 +1811,94 @@ class PipelineOrchestratorService:
         return self.concise_cdncheck_records(self.parse_jsonl(completed.stdout))
 
     def run_nmap_single(self, host: str, nmap_path: str, run_config: RunConfig) -> List[Dict[str, Any]]:
+        if run_config.full_scan:
+            return self.run_nmap_full_scan(host, nmap_path)
+
         args = [nmap_path]
         if self.is_ipv6_target(host):
             args.append("-6")
-        args.extend(["-Pn", "-n", "-sV", "-p", run_config.ports_csv, "-oX", "-", host])
-        completed = run_command(args, label=f"nmap {host}", timeout=3600, check=False, show_spinner=False)
-        return self.concise_nmap_ports(self.parse_nmap_xml(completed.stdout))
+        args.extend([
+            "-Pn", "-n", "-sV", "-T4", "--max-retries", "2",
+            "--host-timeout", "10m", "-p", run_config.ports_csv, "-oX", "-", host,
+        ])
+        completed = run_command(args, label=f"nmap {host}", timeout=660, check=False, show_spinner=False)
+        return self.concise_nmap_ports(
+            self.parse_nmap_xml(
+                completed.stdout,
+                include_closed=True,
+                expand_extraports=True,
+                requested_ports=set(run_config.ports),
+            )
+        )
+
+    def run_nmap_full_scan(self, host: str, nmap_path: str) -> List[Dict[str, Any]]:
+        discovery_args = [nmap_path]
+        if self.is_ipv6_target(host):
+            discovery_args.append("-6")
+        discovery_args.extend([
+            "-Pn", "-n", "-p-", "-T4", "--min-rate", "1000",
+            "--max-retries", "2", "--host-timeout", "15m", "-oX", "-", host,
+        ])
+        discovery = run_command(
+            discovery_args, label=f"nmap full discovery {host}", timeout=960,
+            check=False, show_spinner=False,
+        )
+        discovered = self.concise_nmap_ports(
+            self.parse_nmap_xml(discovery.stdout, include_closed=False, expand_extraports=False)
+        )
+        open_ports = sorted({
+            int(record["port"]) for record in discovered
+            if isinstance(record, dict) and isinstance(record.get("port"), int)
+            and str(record.get("status", "")).lower() == "open"
+        })
+        if not open_ports:
+            return discovered
+
+        service_args = [nmap_path]
+        if self.is_ipv6_target(host):
+            service_args.append("-6")
+        service_args.extend([
+            "-Pn", "-n", "-sV", "-T4", "--max-retries", "2",
+            "--host-timeout", "5m", "-p", ",".join(str(port) for port in open_ports),
+            "-oX", "-", host,
+        ])
+        try:
+            service_scan = run_command(
+                service_args, label=f"nmap service detection {host}", timeout=360,
+                check=False, show_spinner=False,
+            )
+            enriched = self.concise_nmap_ports(
+                self.parse_nmap_xml(service_scan.stdout, include_closed=False, expand_extraports=False)
+            )
+            merged = self.merge_nmap_discovery_and_services(discovered, enriched)
+            return [
+                record for record in merged
+                if record.get("summary") is True or str(record.get("status", "")).lower() == "open"
+            ]
+        except Exception:
+            return [
+                record for record in discovered
+                if record.get("summary") is True or str(record.get("status", "")).lower() == "open"
+            ]
+
+    def merge_nmap_discovery_and_services(
+        self, discovery: List[Dict[str, Any]], services: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        service_index = {
+            (record.get("port"), record.get("protocol", "tcp")): record
+            for record in services if isinstance(record, dict) and isinstance(record.get("port"), int)
+        }
+        merged: List[Dict[str, Any]] = []
+        for record in discovery:
+            item = dict(record)
+            detail = service_index.get((record.get("port"), record.get("protocol", "tcp")))
+            if detail:
+                for key in ("service", "version"):
+                    value = detail.get(key)
+                    if value not in (None, ""):
+                        item[key] = value
+            merged.append(item)
+        return self.concise_nmap_ports(merged)
 
     def is_ipv6_target(self, value: str) -> bool:
         try:
@@ -1541,7 +1995,14 @@ class PipelineOrchestratorService:
             entries.append(entry)
         return entries
 
-    def parse_nmap_xml(self, raw_text: str) -> List[Dict[str, Any]]:
+    def parse_nmap_xml(
+        self,
+        raw_text: str,
+        *,
+        include_closed: bool = False,
+        expand_extraports: bool = False,
+        requested_ports: Optional[set[int]] = None,
+    ) -> List[Dict[str, Any]]:
         if not raw_text.strip():
             return []
         try:
@@ -1550,22 +2011,31 @@ class PipelineOrchestratorService:
             return []
 
         results: List[Dict[str, Any]] = []
+        scanned_ports = self.nmap_scanned_ports(root)
+        if requested_ports:
+            scanned_ports["tcp"] = set(requested_ports)
+
         for host_el in root.findall("host"):
             ports_parent = host_el.find("ports")
             if ports_parent is None:
                 continue
+
+            explicit_by_protocol: Dict[str, set[int]] = {}
             for port_el in ports_parent.findall("port"):
                 state_el = port_el.find("state")
                 if state_el is None:
                     continue
-                state = (state_el.attrib.get("state") or "").strip().lower()
-                if state not in VISIBLE_PORT_STATES:
-                    continue
+                raw_state = (state_el.attrib.get("state") or "").strip().lower()
+                state = self.normalize_nmap_port_state(raw_state, include_closed=include_closed)
                 try:
                     port = int(port_el.attrib.get("portid", "0"))
                 except ValueError:
                     continue
-                item: Dict[str, Any] = {"port": port, "status": state}
+                protocol = (port_el.attrib.get("protocol") or "tcp").strip().lower()
+                explicit_by_protocol.setdefault(protocol, set()).add(port)
+                if state is None:
+                    continue
+                item: Dict[str, Any] = {"port": port, "protocol": protocol, "status": state}
                 service_el = port_el.find("service")
                 if service_el is not None:
                     service_name = self.pick_service_name(service_el)
@@ -1575,7 +2045,83 @@ class PipelineOrchestratorService:
                     if version_text:
                         item["version"] = version_text
                 results.append(item)
+
+            for extra_el in ports_parent.findall("extraports"):
+                raw_state = (extra_el.attrib.get("state") or "").strip().lower()
+                state = self.normalize_nmap_port_state(raw_state, include_closed=include_closed)
+                if state is None:
+                    continue
+                try:
+                    count = int(extra_el.attrib.get("count", "0"))
+                except ValueError:
+                    count = 0
+                if count <= 0:
+                    continue
+
+                if expand_extraports:
+                    # Selected/custom profiles are intentionally small. Reconstruct
+                    # only the actually requested ports so every selected port gets
+                    # an explicit Recon state without ever expanding a full -p- scan.
+                    for protocol, selected in scanned_ports.items():
+                        omitted = sorted(selected - explicit_by_protocol.get(protocol, set()))
+                        for port in omitted:
+                            results.append({"port": port, "protocol": protocol, "status": state})
+                    continue
+
+                # Full scans keep mass states as one compact diagnostic record.
+                results.append({
+                    "summary": True,
+                    "status": state,
+                    "raw-state": raw_state or state,
+                    "count": count,
+                })
         return results
+
+    def nmap_scanned_ports(self, root: ET.Element) -> Dict[str, set[int]]:
+        scanned: Dict[str, set[int]] = {}
+        for scaninfo in root.findall("scaninfo"):
+            protocol = (scaninfo.attrib.get("protocol") or "tcp").strip().lower()
+            services = (scaninfo.attrib.get("services") or "").strip()
+            if not services:
+                continue
+            scanned.setdefault(protocol, set()).update(self.expand_nmap_port_spec(services))
+        return scanned
+
+    def expand_nmap_port_spec(self, value: str) -> set[int]:
+        ports: set[int] = set()
+        for token in str(value or "").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if "-" in token:
+                start_text, end_text = token.split("-", 1)
+                try:
+                    start_port = int(start_text)
+                    end_port = int(end_text)
+                except ValueError:
+                    continue
+                if 0 <= start_port <= end_port <= 65535:
+                    ports.update(range(start_port, end_port + 1))
+                continue
+            try:
+                port = int(token)
+            except ValueError:
+                continue
+            if 0 <= port <= 65535:
+                ports.add(port)
+        return ports
+
+    def normalize_nmap_port_state(self, raw_state: str, *, include_closed: bool = False) -> Optional[str]:
+        state = str(raw_state or "").strip().lower()
+        if state == "open":
+            return "open"
+        if state == "filtered":
+            return "filtered"
+        if state == "closed":
+            return "closed" if include_closed else None
+        if state:
+            return "unknown"
+        return None
 
     def pick_service_name(self, service_el: ET.Element) -> Optional[str]:
         product = (service_el.attrib.get("product") or "").strip()
@@ -1606,22 +2152,38 @@ class PipelineOrchestratorService:
         concise: List[Dict[str, Any]] = []
         seen: set[Tuple[Any, ...]] = set()
         for record in records:
-            port = record.get("port")
-            status = record.get("status")
-            if port is None or not status:
-                continue
-            item: Dict[str, Any] = {"port": int(port), "status": str(status)}
-            service = record.get("service")
-            version = record.get("version")
-            if isinstance(service, str) and service.strip():
-                item["service"] = service.strip()
-            if isinstance(version, str) and version.strip():
-                item["version"] = version.strip()
+            if record.get("summary") is True:
+                item = {
+                    "summary": True,
+                    "status": str(record.get("status") or "unknown"),
+                    "raw-state": str(record.get("raw-state") or record.get("status") or "unknown"),
+                    "count": int(record.get("count") or 0),
+                }
+                notes = record.get("notes")
+                if isinstance(notes, str) and notes.strip():
+                    item["notes"] = notes.strip()
+                if item["count"] <= 0:
+                    continue
+            else:
+                port = record.get("port")
+                status = record.get("status")
+                if port is None or not status:
+                    continue
+                item = {"port": int(port), "protocol": str(record.get("protocol") or "tcp"), "status": str(status)}
+                service = record.get("service")
+                version = record.get("version")
+                notes = record.get("notes")
+                if isinstance(service, str) and service.strip():
+                    item["service"] = service.strip()
+                if isinstance(version, str) and version.strip():
+                    item["version"] = version.strip()
+                if isinstance(notes, str) and notes.strip():
+                    item["notes"] = notes.strip()
             key_tuple = tuple((k, json.dumps(v, sort_keys=True, ensure_ascii=False)) for k, v in sorted(item.items()))
             if key_tuple not in seen:
                 seen.add(key_tuple)
                 concise.append(item)
-        concise.sort(key=lambda x: int(x.get("port", 0)))
+        concise.sort(key=lambda x: (x.get("summary") is True, int(x.get("port", 0))))
         return concise
 
     def first_text_value(self, record: Dict[str, Any], keys: List[str]) -> Optional[str]:
@@ -1657,9 +2219,7 @@ class PipelineOrchestratorService:
                     if not isinstance(asset, dict):
                         continue
                     yield asset
-                    for child_url in asset.get("urls", []):
-                        if isinstance(child_url, dict):
-                            yield child_url
+
 
     def collect_resolved_http_targets(self, report: Dict[str, Any]) -> List[str]:
         targets: List[str] = []

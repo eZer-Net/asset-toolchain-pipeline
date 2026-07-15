@@ -20,6 +20,8 @@ from typing import Any, Dict, Iterable, List, Optional
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RESULTS_DIR = PROJECT_ROOT / "Results"
 BIN_DIR = PROJECT_ROOT / "bin"
+SECLISTS_DIR = BIN_DIR / "SecLists"
+GENERATED_WORDLISTS_DIR = SECLISTS_DIR / ".asset-toolchain"
 THEHARVESTER_DIR = BIN_DIR / "theHarvester"
 THEHARVESTER_REPO_URL = "https://github.com/laramies/theHarvester.git"
 USER_AGENT = "asset-pipeline-ip-centric/2.0"
@@ -32,12 +34,17 @@ BULLET_MARK = "•"
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?!-)(?:[A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$")
 IP_RANGE_RE = re.compile(r"^[0-9A-Fa-f:.]+/[0-9]{1,3}$")
 DEFAULT_PORTS = [22, 25, 53, 80, 81, 110, 143, 443, 444, 465, 587, 631, 993, 995, 3306, 3389, 5432, 6379, 7001, 7443, 8000, 8008, 8080, 8081, 8443, 8888, 9000, 9443]
-VISIBLE_PORT_STATES = {"open", "filtered", "open|filtered", "unfiltered"}
+VISIBLE_PORT_STATES = {"open", "filtered", "open|filtered", "unfiltered", "closed|filtered", "unknown"}
 HTTPX_TRIGGER_STATES = {"open", "open|filtered", "unfiltered"}
 HTTPX_TRIGGER_PORTS = {80, 81, 88, 443, 444, 591, 593, 7001, 7443, 8000, 8008, 8080, 8081, 8443, 8888, 9000, 9043, 9080, 9090, 9443}
 HTTPX_SERVICE_HINTS = ("http", "https", "nginx", "apache", "iis", "caddy", "traefik", "envoy", "haproxy")
 
 TOOL_SPECS = {
+    "gobuster": {
+        "repo": "OJ/gobuster",
+        "go_install": "github.com/OJ/gobuster/v3@latest",
+        "binary": "gobuster",
+    },
     "httpx": {
         "repo": "projectdiscovery/httpx",
         "go_install": "github.com/projectdiscovery/httpx/cmd/httpx@latest",
@@ -74,17 +81,38 @@ class NormalizedAsset:
 @dataclass(frozen=True)
 class RunConfig:
     ports: List[int]
+    full_scan: bool = False
+    dns_bruteforce_profile: str = "disabled"
+    dns_wordlist_path: Optional[str] = None
+    status_codes: Optional[List[int]] = None
 
     @property
     def ports_csv(self) -> str:
-        return ",".join(str(port) for port in self.ports)
+        return "-" if self.full_scan else ",".join(str(port) for port in self.ports)
 
     @property
     def ports_display(self) -> str:
+        if self.full_scan:
+            return "full scan (1-65535)"
         text = self.ports_csv
         if len(text) <= 96:
             return text
         return text[:93] + "..."
+
+    @property
+    def status_filter_display(self) -> str:
+        if self.status_codes is None:
+            return "all"
+        selected = set(self.status_codes)
+        classes = [f"{hundred}xx" for hundred in range(1, 6) if set(range(hundred * 100, hundred * 100 + 100)).issubset(selected)]
+        if classes and selected == set().union(*(set(range(int(item[0]) * 100, int(item[0]) * 100 + 100)) for item in classes)):
+            return " ".join(classes)
+        return ",".join(str(code) for code in self.status_codes)
+
+    @property
+    def dns_bruteforce_enabled(self) -> bool:
+        return self.dns_bruteforce_profile != "disabled"
+
 
 
 class PipelineError(RuntimeError):
@@ -212,6 +240,7 @@ def install_signal_handlers() -> None:
 def ensure_directories() -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     BIN_DIR.mkdir(parents=True, exist_ok=True)
+    GENERATED_WORDLISTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 

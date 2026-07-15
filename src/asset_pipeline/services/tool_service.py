@@ -13,6 +13,9 @@ from asset_pipeline.shared import (
     CHECK_MARK,
     CROSS_MARK,
     InstallError,
+    RunConfig,
+    SECLISTS_DIR,
+    GENERATED_WORDLISTS_DIR,
     THEHARVESTER_DIR,
     THEHARVESTER_REPO_URL,
     TOOL_SPECS,
@@ -68,19 +71,21 @@ THEHARVESTER_API_ENV_MAP: Dict[str, Dict[str, List[str]]] = {
 class ToolService:
     """Checks required binaries/repos, installs missing tools, and returns executable paths."""
 
-    def print_tools_catalog(self) -> None:
-        print_block(
-            "REQUIRED TOOLS",
-            [
-                f"{BULLET_MARK} theHarvester",
-                f"{BULLET_MARK} httpx",
-                f"{BULLET_MARK} cdncheck",
-                f"{BULLET_MARK} nmap",
-            ],
-        )
+    def selected_tool_names(self, run_config: Optional[RunConfig] = None) -> List[str]:
+        tools = ["theharvester", "httpx", "cdncheck", "nmap"]
+        if run_config and run_config.dns_bruteforce_enabled:
+            tools.append("gobuster")
+        return tools
 
-    def ensure_required_tools_installed(self) -> Dict[str, str]:
-        required_tools = ["theharvester", "httpx", "cdncheck", "nmap"]
+    def print_tools_catalog(self, run_config: Optional[RunConfig] = None) -> None:
+        lines = [f"{BULLET_MARK} {name}" for name in self.selected_tool_names(run_config)]
+        lines.append(f"{BULLET_MARK} Certificate Transparency (crt.sh HTTP API)")
+        if run_config and run_config.dns_bruteforce_enabled and run_config.dns_bruteforce_profile != "custom":
+            lines.append(f"{BULLET_MARK} SecLists DNS wordlists")
+        print_block("REQUIRED TOOLS", lines)
+
+    def ensure_required_tools_installed(self, run_config: Optional[RunConfig] = None) -> Dict[str, str]:
+        required_tools = self.selected_tool_names(run_config)
         resolved: Dict[str, str] = {}
         missing: List[str] = []
         check_lines: List[str] = []
@@ -109,6 +114,80 @@ class ToolService:
 
         print_block("TOOLS READY", [f"{CHECK_MARK} {tool_name:<12} {resolved[tool_name]}" for tool_name in required_tools])
         return resolved
+
+    def ensure_dns_wordlist(self, run_config: RunConfig) -> Optional[Path]:
+        if not run_config.dns_bruteforce_enabled:
+            return None
+        if run_config.dns_bruteforce_profile == "custom":
+            path = Path(str(run_config.dns_wordlist_path)).expanduser().resolve()
+            if not path.is_file():
+                raise InstallError(f"Custom DNS wordlist does not exist: {path}")
+            return path
+
+        self.ensure_seclists_installed()
+        profiles = {
+            "small": ("Discovery/DNS/subdomains-top1million-5000.txt", 5000),
+            "medium": ("Discovery/DNS/subdomains-top1million-20000.txt", 20000),
+            "large": ("Discovery/DNS/subdomains-top1million-110000.txt", 110000),
+        }
+        source_rel, limit = profiles[run_config.dns_bruteforce_profile]
+        source = SECLISTS_DIR / source_rel
+        if not source.is_file():
+            raise InstallError(f"SecLists source wordlist is missing: {source}")
+        GENERATED_WORDLISTS_DIR.mkdir(parents=True, exist_ok=True)
+        target = GENERATED_WORDLISTS_DIR / f"subdomains-{run_config.dns_bruteforce_profile}.txt"
+        entries: List[str] = []
+        seen: set[str] = set()
+        for raw_line in source.read_text(encoding="utf-8", errors="ignore").splitlines():
+            value = raw_line.strip().lower().rstrip(".")
+            if not value or value.startswith("#") or value in seen:
+                continue
+            seen.add(value)
+            entries.append(value)
+            if len(entries) >= limit:
+                break
+        if not entries:
+            raise InstallError(f"SecLists wordlist is empty: {source}")
+        target.write_text("\n".join(entries) + "\n", encoding="utf-8")
+        preview = ", ".join(entries[:10])
+        print_block(
+            "DNS WORDLIST READY",
+            [
+                f"profile : {run_config.dns_bruteforce_profile}",
+                f"source  : {source}",
+                f"file    : {target}",
+                f"entries : {len(entries)}",
+                f"first   : {preview}",
+            ],
+        )
+        return target
+
+    def ensure_seclists_installed(self) -> None:
+        marker = SECLISTS_DIR / "Discovery" / "DNS"
+        if marker.is_dir():
+            return
+        git_bin = shutil.which("git")
+        if not git_bin:
+            raise InstallError("SecLists installation requires git")
+        SECLISTS_DIR.parent.mkdir(parents=True, exist_ok=True)
+        if SECLISTS_DIR.exists():
+            shutil.rmtree(SECLISTS_DIR)
+        run_command(
+            [git_bin, "clone", "--depth", "1", "--filter=blob:none", "--sparse",
+             "https://github.com/danielmiessler/SecLists.git", str(SECLISTS_DIR)],
+            label="download SecLists metadata",
+            check=True,
+            timeout=1800,
+            show_spinner=True,
+        )
+        run_command(
+            [git_bin, "sparse-checkout", "set", "Discovery/DNS"],
+            label="download SecLists DNS wordlists",
+            cwd=SECLISTS_DIR,
+            check=True,
+            timeout=1800,
+            show_spinner=True,
+        )
 
     def resolve_tool(self, tool_name: str) -> Optional[str]:
         if tool_name == "theharvester":

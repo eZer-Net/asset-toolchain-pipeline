@@ -64,13 +64,166 @@ class InputService:
             raise FileNotFoundError(f"Assets file does not exist: {path}")
         return path
 
+    def configure_pipeline(self) -> RunConfig:
+        self.print_passive_osint()
+        dns_profile, dns_wordlist = self.configure_dns_bruteforce()
+        status_codes = self.configure_status_codes()
+        port_config = self.configure_ports()
+        return RunConfig(
+            ports=port_config.ports,
+            full_scan=port_config.full_scan,
+            dns_bruteforce_profile=dns_profile,
+            dns_wordlist_path=dns_wordlist,
+            status_codes=status_codes,
+        )
+
+    def print_passive_osint(self) -> None:
+        print_block(
+            "PASSIVE OSINT",
+            [
+                "stage  : passive asset discovery from public sources",
+                "tools  : theHarvester + Certificate Transparency (crt.sh)",
+                "status : always enabled",
+            ],
+        )
+
+    def configure_dns_bruteforce(self) -> tuple[str, Optional[str]]:
+        print_block(
+            "ACTIVE DISCOVERY",
+            [
+                "stage : active DNS discovery by wordlist bruteforce",
+                "tool  : Gobuster DNS",
+                "lists : downloaded from SecLists/Discovery/DNS",
+                "1 : disabled (default)",
+                "2 : small  (5,000 entries)",
+                "    source: SecLists/Discovery/DNS/subdomains-top1million-5000.txt",
+                "3 : medium (20,000 entries)",
+                "    source: SecLists/Discovery/DNS/subdomains-top1million-20000.txt",
+                "4 : large  (110,000 entries)",
+                "    source: SecLists/Discovery/DNS/subdomains-top1million-110000.txt",
+                "5 : custom wordlist (one DNS label per line)",
+                "input : Enter = disabled | 1/2/3/4/5",
+            ],
+        )
+        raw = input("> ").strip().lower()
+        if raw in {"", "1", "disabled", "off", "no", "n"}:
+            return "disabled", None
+        if raw in {"2", "small"}:
+            return "small", None
+        if raw in {"3", "medium"}:
+            return "medium", None
+        if raw in {"4", "large"}:
+            return "large", None
+        if raw in {"5", "custom"}:
+            print("Enter local wordlist path:")
+            path = Path(os.path.expanduser(input("> ").strip().strip('"').strip("'"))).resolve()
+            self.validate_custom_wordlist(path)
+            return "custom", str(path)
+        raise InputValidationError(f"Unknown DNS bruteforce mode: {raw}")
+
+    def validate_custom_wordlist(self, path: Path) -> None:
+        if not path.is_file():
+            raise InputValidationError(f"Wordlist does not exist: {path}")
+        if not os.access(path, os.R_OK):
+            raise InputValidationError(f"Wordlist is not readable: {path}")
+        valid = 0
+        invalid: List[str] = []
+        seen: set[str] = set()
+        for line_number, raw_line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
+            value = raw_line.strip().lower().rstrip(".")
+            if not value or value.startswith("#"):
+                continue
+            if any(char.isspace() for char in value) or "://" in value or "/" in value:
+                invalid.append(f"line {line_number}: {raw_line[:80]}")
+                continue
+            if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value):
+                invalid.append(f"line {line_number}: {raw_line[:80]}")
+                continue
+            if value not in seen:
+                seen.add(value)
+                valid += 1
+        if invalid:
+            preview = "; ".join(invalid[:5])
+            raise InputValidationError(f"Wordlist contains invalid entries ({len(invalid)}): {preview}")
+        if valid == 0:
+            raise InputValidationError("Wordlist does not contain valid entries")
+        print_block("WORDLIST VALIDATION", [f"path    : {path}", f"entries : {valid}", "format  : one DNS label per line", "status  : accepted"])
+
+    def configure_status_codes(self) -> Optional[List[int]]:
+        print_block(
+            "HTTP STATUS FILTER",
+            [
+                "1 : all valid HTTP responses (default)",
+                "2 : exact status codes, for example 200,201,301,403",
+                "3 : status classes, for example: 2xx 3xx 4xx",
+                "input : Enter = all | 1/2/3",
+            ],
+        )
+        raw = input("> ").strip().lower()
+        if raw in {"", "1", "all"}:
+            return None
+        if raw in {"2", "custom", "exact"}:
+            print("Add HTTP status codes as comma-separated values:")
+            values = input("> ").strip()
+            codes: List[int] = []
+            seen: set[int] = set()
+            for part in values.split(","):
+                part = part.strip()
+                if not part.isdigit():
+                    raise InputValidationError(f"Invalid HTTP status code: {part}")
+                code = int(part)
+                if code < 100 or code > 599:
+                    raise InputValidationError(f"HTTP status code out of range: {code}")
+                if code not in seen:
+                    seen.add(code); codes.append(code)
+            if not codes:
+                raise InputValidationError("HTTP status-code list must not be empty")
+            codes.sort()
+            print_block("HTTP STATUS FILTER ACTIVE", ["mode  : exact codes", f"codes : {','.join(str(code) for code in codes)}"])
+            return codes
+        if raw in {"3", "range", "ranges", "classes"}:
+            print("Add HTTP status classes separated by spaces (example: 2xx 3xx):")
+            values = input("> ").strip().lower().split()
+            if not values:
+                raise InputValidationError("HTTP status-class list must not be empty")
+            allowed = {"1xx", "2xx", "3xx", "4xx", "5xx"}
+            invalid = [value for value in values if value not in allowed]
+            if invalid:
+                raise InputValidationError(f"Invalid HTTP status class: {', '.join(invalid)}")
+            classes = sorted(set(values), key=lambda item: int(item[0]))
+            codes = [code for item in classes for code in range(int(item[0]) * 100, int(item[0]) * 100 + 100)]
+            print_block("HTTP STATUS FILTER ACTIVE", ["mode    : status classes", f"classes : {' '.join(classes)}"])
+            return codes
+        raise InputValidationError(f"Unknown HTTP status filter mode: {raw}")
+
     def configure_ports(self) -> RunConfig:
         default_csv = ",".join(str(port) for port in DEFAULT_PORTS)
-        print_block("PORTS", [f"default : {default_csv}", "input   : Enter = keep default | csv = custom ports"])
-        raw = input("> ").strip()
-        ports = self.parse_ports_input(raw or default_csv)
-        print_block("PORTS ACTIVE", [f"ports : {','.join(str(port) for port in ports)}"])
-        return RunConfig(ports=ports)
+        print_block(
+            "PORTS",
+            [
+                f"default : {default_csv}",
+                "1       : default port profile",
+                "2       : custom comma-separated ports",
+                "3       : full TCP scan (1-65535)",
+                "input   : Enter = default | 1/2/3 = choose mode | csv = custom ports",
+            ],
+        )
+        raw = input("> ").strip().lower()
+
+        if raw in {"3", "full", "all", "full-scan", "full_scan"}:
+            print_block("PORTS ACTIVE", ["mode  : full TCP scan", "ports : 1-65535 (nmap -p-)"])
+            return RunConfig(ports=[], full_scan=True)
+
+        if raw == "2":
+            print("Add custom TCP ports as comma-separated values:")
+            raw = input("> ").strip()
+
+        if raw in {"", "1", "default"}:
+            raw = default_csv
+
+        ports = self.parse_ports_input(raw)
+        print_block("PORTS ACTIVE", ["mode  : selected TCP ports", f"ports : {','.join(str(port) for port in ports)}"])
+        return RunConfig(ports=ports, full_scan=False)
 
     def parse_ports_input(self, raw: str) -> List[int]:
         parts = [part.strip() for part in raw.split(",") if part.strip()]
@@ -185,7 +338,7 @@ class InputService:
 
     def normalize_target_type(self, raw_type: str, value: str) -> str:
         raw_type = raw_type.lower()
-        if raw_type in {"domain", "subdomain", "ip", "url"}:
+        if raw_type in {"domain", "subdomain", "ip"}:
             return raw_type
         if self.is_url(value):
             return "url"
